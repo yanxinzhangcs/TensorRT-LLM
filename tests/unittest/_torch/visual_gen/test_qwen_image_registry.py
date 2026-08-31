@@ -20,6 +20,7 @@ from tensorrt_llm._torch.modules.linear import (
     Linear,
     NVFP4LinearMethod,
     UnquantizedLinearMethod,
+    WeightMode,
 )
 
 # Importing the models package side-effects the ``@register_pipeline``
@@ -69,6 +70,40 @@ def _tiny_static_quant_model(quant_algo: QuantAlgo) -> QwenImageTransformer2DMod
         joint_attention_dim=16,
         axes_dims_rope=(4, 6, 6),
     )
+
+
+_FUSED_QKV_SOURCE_NAMES = {
+    "img_qkv_proj": ("to_q", "to_k", "to_v"),
+    "add_qkv_proj": ("add_q_proj", "add_k_proj", "add_v_proj"),
+}
+
+
+def _add_fused_qkv_source_parameters(
+    model: QwenImageTransformer2DModel,
+    checkpoint: dict[str, torch.Tensor],
+) -> None:
+    """Add the six source projection keys serialized by Qwen checkpoints."""
+    for module_name, module in model.named_modules():
+        if not isinstance(module, Linear):
+            continue
+        loading = getattr(module, "weights_loading_config", None)
+        if loading is None or loading.weight_mode != WeightMode.FUSED_QKV_LINEAR:
+            continue
+
+        source_names = _FUSED_QKV_SOURCE_NAMES[module_name.rsplit(".", 1)[-1]]
+        parent = module_name.rsplit(".", 1)[0]
+        shard_sizes = [module.fused_weight_shard_indices_mapping[key][1] for key in ("q", "k", "v")]
+        for parameter_name, _ in module.named_parameters(recurse=False):
+            fused_name = f"{module_name}.{parameter_name}"
+            if fused_name not in checkpoint:
+                continue
+            value = checkpoint[fused_name]
+            if value.ndim > 0 and value.shape[0] == sum(shard_sizes):
+                source_values = value.split(shard_sizes, dim=0)
+            else:
+                source_values = (value, value, value)
+            for source_name, source_value in zip(source_names, source_values):
+                checkpoint[f"{parent}.{source_name}.{parameter_name}"] = source_value.clone()
 
 
 def test_qwen_image_pipeline_is_registered():
@@ -211,21 +246,21 @@ def test_transformer_applies_quant_config_ignore_list() -> None:
 
     assert model.img_in.quant_config.quant_algo is None
     assert model.proj_out.quant_config.quant_algo is None
-    assert model.transformer_blocks[0].attn.add_q_proj.quant_config.quant_algo is None
+    assert model.transformer_blocks[0].attn.add_qkv_proj.quant_config.quant_algo is None
     assert model.transformer_blocks[0].img_mlp.up_proj.quant_config.quant_algo is None
     assert isinstance(model.img_in.quant_method, UnquantizedLinearMethod)
     assert isinstance(model.proj_out.quant_method, UnquantizedLinearMethod)
     assert isinstance(
-        model.transformer_blocks[0].attn.add_q_proj.quant_method, UnquantizedLinearMethod
+        model.transformer_blocks[0].attn.add_qkv_proj.quant_method, UnquantizedLinearMethod
     )
     assert isinstance(
         model.transformer_blocks[0].img_mlp.up_proj.quant_method, UnquantizedLinearMethod
     )
 
     assert model.txt_in.quant_config.quant_algo == QuantAlgo.NVFP4
-    assert model.transformer_blocks[1].attn.add_q_proj.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert model.transformer_blocks[1].attn.add_qkv_proj.quant_config.quant_algo == QuantAlgo.NVFP4
     assert isinstance(model.txt_in.quant_method, NVFP4LinearMethod)
-    assert isinstance(model.transformer_blocks[1].attn.add_q_proj.quant_method, NVFP4LinearMethod)
+    assert isinstance(model.transformer_blocks[1].attn.add_qkv_proj.quant_method, NVFP4LinearMethod)
 
 
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8], ids=["nvfp4", "fp8"])
@@ -245,7 +280,7 @@ def test_static_quant_excludes_high_precision_layers(quant_algo: QuantAlgo) -> N
         model.txt_in,
         model.proj_out,
         model.norm_out.linear,
-        model.transformer_blocks[0].attn.to_q,
+        model.transformer_blocks[0].attn.img_qkv_proj,
     )
     for module in excluded:
         assert module.quant_config is not None
@@ -258,10 +293,10 @@ def test_static_quant_excludes_high_precision_layers(quant_algo: QuantAlgo) -> N
     assert not hasattr(model.img_in, "weight_scale")
 
     # Included layers materialize in the selected static-quant layout.
-    keep = model.transformer_blocks[1].attn.to_q.quant_config
+    keep = model.transformer_blocks[1].attn.img_qkv_proj.quant_config
     assert keep is not None and keep.quant_algo == quant_algo
     assert keep.kv_cache_quant_algo is None
-    quantized = model.transformer_blocks[1].attn.to_q
+    quantized = model.transformer_blocks[1].attn.img_qkv_proj
     assert quantized._weights_created
     assert hasattr(quantized, "weight_scale")
     assert hasattr(quantized, "input_scale")
@@ -269,13 +304,13 @@ def test_static_quant_excludes_high_precision_layers(quant_algo: QuantAlgo) -> N
     if quant_algo == QuantAlgo.NVFP4:
         assert isinstance(quantized.quant_method, NVFP4LinearMethod)
         assert quantized.weight.dtype == torch.uint8
-        assert quantized.weight.shape == (16, 8)
+        assert quantized.weight.shape == (48, 8)
         assert quantized.weight_scale.dtype == torch.uint8
         assert quantized.weight_scale_2.dtype == torch.float32
     else:
         assert isinstance(quantized.quant_method, FP8QDQLinearMethod)
         assert quantized.weight.dtype == torch.float8_e4m3fn
-        assert quantized.weight.shape == (16, 16)
+        assert quantized.weight.shape == (48, 16)
         assert quantized.input_scale.dtype == torch.float32
         assert quantized.input_scale.shape == torch.Size([])
         assert quantized.weight_scale.dtype == torch.float32
@@ -307,7 +342,8 @@ def test_static_quant_load_allows_only_missing_non_serialized_parameters(
         and module.quant_config.quant_algo == quant_algo
     }
     assert quantized_module_names
-    assert "transformer_blocks.1.attn.to_q" in quantized_module_names
+    assert "transformer_blocks.1.attn.img_qkv_proj" in quantized_module_names
+    assert "transformer_blocks.1.attn.add_qkv_proj" in quantized_module_names
     assert all(name.startswith("transformer_blocks.1.") for name in quantized_module_names)
 
     non_serialized = {
@@ -323,6 +359,7 @@ def test_static_quant_load_allows_only_missing_non_serialized_parameters(
     checkpoint = {
         name: param.detach() for name, param in expected.items() if name not in non_serialized
     }
+    _add_fused_qkv_source_parameters(model, checkpoint)
     monkeypatch.setattr(
         DynamicLinearWeightLoader,
         "get_linear_weights",
@@ -360,6 +397,7 @@ def test_static_fp8_loads_serialized_weights_and_derives_inverse_scale() -> None
         for name, param in expected.items()
         if name not in non_serialized
     }
+    _add_fused_qkv_source_parameters(model, checkpoint)
     for name, value in checkpoint.items():
         if name.endswith(".input_scale"):
             value.fill_(2.0)
@@ -368,9 +406,12 @@ def test_static_fp8_loads_serialized_weights_and_derives_inverse_scale() -> None
 
     model.load_weights(checkpoint)
 
-    target_name = "transformer_blocks.1.attn.to_q"
-    target = model.transformer_blocks[1].attn.to_q
-    assert torch.equal(target.weight, checkpoint[f"{target_name}.weight"])
+    target = model.transformer_blocks[1].attn.img_qkv_proj
+    source_prefix = "transformer_blocks.1.attn"
+    source_weight = torch.cat(
+        [checkpoint[f"{source_prefix}.{name}.weight"] for name in ("to_q", "to_k", "to_v")]
+    )
+    assert torch.equal(target.weight, source_weight)
     assert target.input_scale.item() == pytest.approx(2.0)
     assert target.inv_input_scale.item() == pytest.approx(0.5)
     assert target.weight_scale.item() == pytest.approx(0.25)

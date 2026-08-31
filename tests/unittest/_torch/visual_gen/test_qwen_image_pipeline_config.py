@@ -410,9 +410,8 @@ def test_qwen_joint_attention_tp2_shards_both_streams():
     )
 
     assert not attention.fuse_qk_norm_rope
-    assert attention.add_q_proj.tp_mode == TensorParallelMode.COLUMN
-    assert attention.add_k_proj.tp_mode == TensorParallelMode.COLUMN
-    assert attention.add_v_proj.tp_mode == TensorParallelMode.COLUMN
+    assert attention.img_qkv_proj.tp_mode == TensorParallelMode.COLUMN
+    assert attention.add_qkv_proj.tp_mode == TensorParallelMode.COLUMN
     assert attention.to_add_out.tp_mode == TensorParallelMode.ROW
     assert joint_q.shape == (1, 7, 8)
     assert joint_k.shape == (1, 7, 8)

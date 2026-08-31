@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the packed joint-QKV projection recipes and their dispatch
 seam (``tensorrt_llm/_torch/visual_gen/modules/packed_qkv.py``).
 
@@ -12,6 +15,10 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    QwenJointAttention,
+)
 
 # Importing the module registers the trtllm_vgoa::packed_qkv_proj_* leaf ops.
 from tensorrt_llm._torch.visual_gen.modules.packed_qkv import (
@@ -29,6 +36,13 @@ HIDDEN = 128
 PACKED = 3 * HIDDEN
 S_TXT = 17
 S_IMG = 64
+
+
+class _QwenJointAttentionWithoutRope(QwenJointAttention):
+    """Keep the production QKV preparation path while isolating its output."""
+
+    def apply_packed_qk_norm_rope(self, *args: object, **kwargs: object) -> None:
+        return None
 
 
 def _make_inputs(device="cuda", dtype=torch.bfloat16):
@@ -121,3 +135,72 @@ def test_recipe_dispatch_select_and_build():
     assert (
         select_packed_qkv_recipe((txt_proj, fp16), out_features=PACKED, in_features=HIDDEN) is None
     )
+
+
+@requires_cuda
+def test_qwen_attention_compiled_path_engages_packed_recipe_and_matches_fallback() -> None:
+    """The production model census and compiled dispatch must engage the leaf op.
+
+    The QK-norm/RoPE epilogue is intentionally a no-op in this test so the
+    assertion isolates the QKV projection selected inside the production
+    ``QwenJointAttention._prepare_qkv_fused`` implementation.
+    """
+    torch.manual_seed(2)
+    attention = (
+        _QwenJointAttentionWithoutRope(
+            dim=HIDDEN,
+            num_attention_heads=2,
+            attention_head_dim=HIDDEN // 2,
+            dtype=torch.bfloat16,
+            config=DiffusionModelConfig(),
+        )
+        .cuda()
+        .eval()
+    )
+    attention.finalize_fused_qkv_pack()
+    assert attention._qkv_pack_recipe == "bf16"
+
+    hidden_states = torch.randn(1, S_IMG, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    encoder_hidden_states = torch.randn(1, S_TXT, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    unused_rope = (
+        torch.empty(S_TXT + S_IMG, HIDDEN // 2, device="cuda", dtype=torch.bfloat16),
+        torch.empty(S_TXT + S_IMG, HIDDEN // 2, device="cuda", dtype=torch.bfloat16),
+    )
+
+    selected_recipe = attention._qkv_pack_recipe
+    attention._qkv_pack_recipe = None
+    with torch.inference_mode():
+        fallback = attention._prepare_qkv_fused(
+            hidden_states,
+            encoder_hidden_states,
+            unused_rope,
+            unused_rope,
+        )
+
+    attention._qkv_pack_recipe = selected_recipe
+    compiled_prepare = torch.compile(attention._prepare_qkv_fused, fullgraph=True)
+    with torch.inference_mode():
+        # The first invocation performs the Inductor compile. ``fullgraph``
+        # makes a graph break a hard failure rather than an eager fallback.
+        compiled_prepare(hidden_states, encoder_hidden_states, unused_rope, unused_rope)
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profiler:
+            packed = compiled_prepare(
+                hidden_states,
+                encoder_hidden_states,
+                unused_rope,
+                unused_rope,
+            )
+            torch.cuda.synchronize()
+
+    event_names = {event.key for event in profiler.key_averages()}
+    assert any("trtllm_vgoa::packed_qkv_proj_bf16" in name for name in event_names), (
+        "compiled QwenJointAttention silently missed the selected packed-QKV recipe"
+    )
+    for packed_tensor, fallback_tensor in zip(packed, fallback):
+        assert torch.equal(packed_tensor, fallback_tensor)
