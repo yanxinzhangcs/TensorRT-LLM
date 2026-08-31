@@ -32,15 +32,16 @@ import openai
 import pytest
 import requests
 import yaml
-from defs.common import get_free_port_in_ci as get_free_port
+from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
-from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
+from ..conftest import (get_device_count, get_sm_version, llm_models_root,
+                        parametrize_with_ids, skip_no_hopper,
+                        skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail,
                             LlmapiAccuracyTestHarness, get_accuracy_task)
@@ -107,6 +108,38 @@ def has_nvlink():
     except Exception:
         # Any other unexpected error
         return False
+
+
+def get_disagg_ucx_tls() -> str:
+    """UCX transports for the disaggregated worker processes.
+
+    Without NVLink, cuda_ipc is excluded (preserving the pre-existing
+    behavior, which leaves IB allowed there). With NVLink on Hopper (SM90),
+    IB is allowed: KVCacheManagerV2 KV pools are VMM allocations that CUDA
+    IPC cannot map without fabric handles, so KV transfers need IB GPUDirect
+    RDMA to avoid falling back to slow non-IPC emulation. gdr_copy is
+    intentionally excluded on SM90, matching the get_ucx_tls() helpers under
+    disaggregated/. On the remaining NVLink architectures IB stays excluded
+    to avoid hangs on the CI B200 cluster.
+
+    Returns:
+        str: The UCX_TLS transport selection string.
+    """
+    if not has_nvlink():
+        return "^cuda_ipc"
+    if get_sm_version() == 90:
+        return "^gdr_copy"
+    return "^ib"
+
+
+# get_disagg_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
+# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
+# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
+# address handles to cross-rail peers and time out, hanging the workers.
+# Drop it at import time so worker environments (copied from os.environ)
+# fall back to standard GID-based address resolution; no-op when absent.
+if get_sm_version() == 90:
+    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 class MyThreadPoolExecutor(ThreadPoolExecutor):
@@ -197,17 +230,18 @@ def launch_disaggregated_llm(
     _apply_perf_flags(ctx_server_config)
     _apply_perf_flags(gen_server_config)
 
-    # Always assign free port dynamically for service discovery
-    serve_port = get_free_port()
-    disaggregated_server_config["port"] = serve_port
+    # Let the kernel assign the port inside trtllm-serve and report it back,
+    # rather than reserving one here and racing whoever takes it before the
+    # server binds.
+    disaggregated_server_config["port"] = 0
+    disagg_addr_path = os.path.join(temp_dir.name, "disagg_server.addr")
 
-    # Use HTTP service discovery
-    cluster_uri = f"http://localhost:{serve_port}"
-    print(f"Using HTTP service discovery at {cluster_uri}")
-
-    # Create service discovery config
+    # Create service discovery config. The server hosts the HTTP cluster
+    # storage on its own port, so the port in *its* copy of cluster_uri is
+    # never read (HttpClusterStorageServer.__init__ ignores the URI); only the
+    # workers dial it, and they get the resolved address below.
     disagg_cluster = {
-        "cluster_uri": cluster_uri,
+        "cluster_uri": "http://localhost:0",
         "cluster_name": "test_cluster",
         "heartbeat_interval_sec": 5,
         "inactive_timeout_sec": 10,
@@ -230,15 +264,14 @@ def launch_disaggregated_llm(
     disaggregated_server_config["internal_request_auth_key"] = (
         internal_request_auth_key)
 
-    # Inject into worker configs
+    # Inject into worker configs. disagg_cluster is replaced in
+    # write_worker_configs below, once the server's real address is known.
     ctx_server_config = {
         **ctx_server_config,
-        "disagg_cluster": disagg_cluster,
         "internal_request_auth_key": internal_request_auth_key,
     }
     gen_server_config = {
         **gen_server_config,
-        "disagg_cluster": disagg_cluster,
         "internal_request_auth_key": internal_request_auth_key,
     }
 
@@ -246,12 +279,20 @@ def launch_disaggregated_llm(
         yaml.dump(disaggregated_server_config, f)
     ctx_server_config_path = os.path.join(temp_dir.name,
                                           "ctx_server_config.yaml")
-    with open(ctx_server_config_path, "w") as f:
-        yaml.dump(ctx_server_config, f)
     gen_server_config_path = os.path.join(temp_dir.name,
                                           "gen_server_config.yaml")
-    with open(gen_server_config_path, "w") as f:
-        yaml.dump(gen_server_config, f)
+
+    def write_worker_configs(cluster_uri):
+        """Write the worker configs once the server's real address is known."""
+        worker_cluster = {**disagg_cluster, "cluster_uri": cluster_uri}
+        with open(ctx_server_config_path, "w") as f:
+            yaml.dump({
+                **ctx_server_config, "disagg_cluster": worker_cluster
+            }, f)
+        with open(gen_server_config_path, "w") as f:
+            yaml.dump({
+                **gen_server_config, "disagg_cluster": worker_cluster
+            }, f)
 
     args = LlmArgs(model=model_name, tensor_parallel_size=tensor_parallel_size)
 
@@ -310,8 +351,7 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-        env["UCX_TLS"] = "^ib"
+        env["UCX_TLS"] = get_disagg_ucx_tls()
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
 
@@ -320,8 +360,6 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + ctx_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
-        if not has_nvlink():
-            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += ctx_total_gpus
 
         ctx_server_args = ctx_args + [
@@ -347,8 +385,7 @@ def launch_disaggregated_llm(
         # NIXL backend ignores this env-var fallback; skip it.
         if cache_transceiver_config_backend != "NIXL":
             env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-        # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
-        env["UCX_TLS"] = "^ib"
+        env["UCX_TLS"] = get_disagg_ucx_tls()
         if enable_perf:
             env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = kv_cache_perf_dir
         if cache_transceiver_config_backend == "NIXL":
@@ -356,8 +393,6 @@ def launch_disaggregated_llm(
         gpu_range = range(current_gpu_offset,
                           current_gpu_offset + gen_total_gpus)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_range))
-        if not has_nvlink():
-            env["UCX_TLS"] = "^cuda_ipc"
         current_gpu_offset += gen_total_gpus
 
         gen_server_args = gen_args + [
@@ -402,15 +437,29 @@ def launch_disaggregated_llm(
     server_cmd = [
         trtllm_serve_path, "disaggregated", "-c",
         disaggregated_serving_config_path, "--server_start_timeout",
-        str(server_waiting_timeout), "-r", "360000"
+        str(server_waiting_timeout), "-r", "360000", "--report_addr",
+        disagg_addr_path
     ]
+    # The disagg server must come up first: it owns the cluster storage the
+    # workers register with, and only it knows the port the kernel handed it.
     with (
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
             temp_dir,
-            multi_popen(ctx_servers, "ctx") as ctx_processes,
-            multi_popen(gen_servers, "gen") as gen_processes,
-            multi_popen([(base_env, server_cmd)], "disagg") as server_processes,
+            contextlib.ExitStack() as server_stack,
     ):
+        server_processes = server_stack.enter_context(
+            multi_popen([(base_env, server_cmd)], "disagg"))
+        _, serve_port = wait_for_reported_addr(disagg_addr_path,
+                                               server_waiting_timeout,
+                                               server_processes[0])
+        print(f"Using HTTP service discovery at http://localhost:{serve_port}")
+        write_worker_configs(f"http://localhost:{serve_port}")
+
+        ctx_processes = server_stack.enter_context(
+            multi_popen(ctx_servers, "ctx"))
+        gen_processes = server_stack.enter_context(
+            multi_popen(gen_servers, "gen"))
+
         start_time = time.time()
         server_is_ready = False
         while time.time() - start_time < server_waiting_timeout:
@@ -1105,6 +1154,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("disable_overlap_scheduler", [True, False],
+                             ids=["overlap_off", "overlap_on"])
     @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
         (1, 2, 2, False),
         (1, 2, 2, True),
@@ -1119,7 +1170,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["cudagraph:with_padding"])
     @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
+                                   gen_pp, gen_tp, gen_cp, enable_attention_dp,
+                                   disable_overlap_scheduler):
         # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
         if comms_medium == "nccl":
             use_nccl_for_alltoall = True
@@ -1150,9 +1202,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # DEFAULT drops the per-test UCX pinning but still runs UCX, since
             # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
             # backend but NIXL. Transport coverage is unchanged by this move.
+            # CPP is explicit: this test runs on UCX (see the DEFAULT note
+            # above), and DeepSeek's Python preference would otherwise be
+            # adopted verbatim and fail at creation on a non-NIXL backend.
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "CPP",
             },
         }
         gen_server_config = {
@@ -1166,13 +1222,14 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "use_nccl_for_alltoall": use_nccl_for_alltoall,
                 "fifo_version": fifo_version,
             },
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler": disable_overlap_scheduler,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
+                "transceiver_runtime": "CPP",
             },
             "enable_attention_dp": enable_attention_dp,
         }
@@ -1662,6 +1719,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     def test_nixl_backend(self):
+        # transceiver_runtime is left at 'auto', which resolves to the Python
+        # transceiver (the global default) on the NIXL backend.
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
@@ -1780,23 +1839,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     def test_chunked_prefill(self):
         self._test_chunked_prefill_helper(ctx_pp=1)
 
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
-        (1, 2, 2, False),
-        (1, 2, 2, True),
-    ],
-                             ids=["pp1tp2cp2", "pp1dp2cp2"])
-    @pytest.mark.parametrize("cuda_graph_config", [
-        {
-            "enable_padding": True,
-            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
-        },
-    ],
-                             ids=["cudagraph:with_padding"])
-    @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
-    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
+    def _run_helix_test(self, comms_medium, cuda_graph_config, gen_pp, gen_tp,
+                        gen_cp, enable_attention_dp, disable_overlap_scheduler):
         # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
         if comms_medium == "nccl":
             use_nccl_for_alltoall = True
@@ -1841,12 +1885,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "use_nccl_for_alltoall": use_nccl_for_alltoall,
                 "fifo_version": fifo_version,
             },
-            "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": cache_transceiver_config.copy(),
             "enable_attention_dp": enable_attention_dp,
+            "disable_overlap_scheduler": disable_overlap_scheduler,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1865,6 +1909,40 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    # overlap_on is the regression guard for the helix x overlap-scheduler
+    # position_id off-by-one: generation batches are prepared one iteration
+    # ahead of py_decoding_iter, and an uncompensated helix position repeats
+    # once and corrupts the KV cache from the second decode step on. GSM8K
+    # fails hard without the compensation.
+    @pytest.mark.parametrize("disable_overlap_scheduler", [True, False],
+                             ids=["overlap_off", "overlap_on"])
+    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
+        (1, 2, 2, False),
+        (1, 2, 2, True),
+    ],
+                             ids=["pp1tp2cp2", "pp1dp2cp2"])
+    @pytest.mark.parametrize("cuda_graph_config", [
+        {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+    ],
+                             ids=["cudagraph:with_padding"])
+    @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
+    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
+                                   gen_pp, gen_tp, gen_cp, enable_attention_dp,
+                                   disable_overlap_scheduler):
+        self._run_helix_test(
+            comms_medium,
+            cuda_graph_config,
+            gen_pp,
+            gen_tp,
+            gen_cp,
+            enable_attention_dp,
+            disable_overlap_scheduler=disable_overlap_scheduler)
 
     @pytest.mark.skip_less_device(2)
     def test_gen_first(self):
@@ -1969,6 +2047,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_mixed_ctx_gen_model(self, ctx_pp, gen_tp):
         ctx_model = self.FP4_MODEL
         gen_model = self.FP8_MODEL
+        # Explicit NIXL so the launcher does not force the UCX env fallback;
+        # with the NIXL backend, transceiver_runtime='auto' resolves to the
+        # Python transceiver (the global default).
         return run_parallel_test("Qwen3/Qwen3-30B-A3B",
                                  ctx_model,
                                  ctx_pp=ctx_pp,
@@ -1979,7 +2060,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
                                  ctx_model=ctx_model,
                                  gen_model=gen_model,
                                  ctx_instances=1,
-                                 gen_instances=1)
+                                 gen_instances=1,
+                                 cache_transceiver_backend="NIXL")
 
 
 @pytest.mark.timeout(10800)
@@ -2133,20 +2215,15 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "mtp_nextn,block_reuse,use_py_transceiver",
         [
-            (0, False, False),
             (0, False, True),
-            (3, True, False),
+            (3, True, True),
         ],
         ids=[
-            "mtp_nextn=0-block_reuse=False-use_py_transceiver=False",
             "mtp_nextn=0-block_reuse=False-use_py_transceiver=True",
-            "mtp_nextn=3-block_reuse=True-use_py_transceiver=False",
+            "mtp_nextn=3-block_reuse=True-use_py_transceiver=True",
         ],
     )
     def test_auto_dtype(self, mtp_nextn, block_reuse, use_py_transceiver):
-        if use_py_transceiver and block_reuse:
-            pytest.skip("Python transceiver does not support block reuse")
-
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         if mtp_nextn > 0:
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
@@ -2155,6 +2232,12 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         if block_reuse:
             ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
             gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
+            ctx_cfg["kv_cache_config"]["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
+            gen_cfg["kv_cache_config"]["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
@@ -2162,7 +2245,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     def test_ctx_dp2_gen_tp4(self):
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(
-            use_py_transceiver=False)
+            use_py_transceiver=True)
         # corner case: max_batch_size = 1 + dp for ctx to check if dp dummy requests are handled correctly
         ctx_cfg["max_batch_size"] = 1
         ctx_cfg["enable_attention_dp"] = True
@@ -2244,7 +2327,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    @parametrize_with_ids("use_py_transceiver", [True, False])
+    @parametrize_with_ids("use_py_transceiver", [True])
     def test_auto_dtype(self, use_py_transceiver, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
